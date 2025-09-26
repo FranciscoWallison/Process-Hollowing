@@ -1,9 +1,9 @@
 struct PROCESS_BASIC_INFORMATION {
-	PVOID Reserved1;
-	DWORD PebBaseAddress;
-	PVOID Reserved2[2];
-	DWORD UniqueProcessId;
-	PVOID Reserved3;
+PVOID Reserved1;
+PVOID PebBaseAddress;
+PVOID Reserved2[2];
+ULONG_PTR UniqueProcessId;
+PVOID Reserved3;
 };
 
 typedef NTSTATUS (WINAPI* _NtUnmapViewOfSection)(

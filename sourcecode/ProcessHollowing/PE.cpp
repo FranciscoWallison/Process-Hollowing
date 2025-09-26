@@ -20,7 +20,7 @@ bool InitializeNtQueryInformationProcess()
     return true;
 }
 
-DWORD FindRemotePEB(HANDLE hProcess)
+uintptr_t FindRemotePEB(HANDLE hProcess)
 {
     if(!ntQueryInformationProcess)
     {
@@ -32,12 +32,12 @@ DWORD FindRemotePEB(HANDLE hProcess)
     DWORD dwReturnLength = 0;
 
     ntQueryInformationProcess(hProcess, 0, &basicInfo, sizeof(basicInfo), &dwReturnLength);
-    return basicInfo.PebBaseAddress;
+    return reinterpret_cast<uintptr_t>(basicInfo.PebBaseAddress);
 }
 
 PEB* ReadRemotePEB(HANDLE hProcess)
 {
-    DWORD dwPEBAddress = FindRemotePEB(hProcess);
+    uintptr_t dwPEBAddress = FindRemotePEB(hProcess);
     if(!dwPEBAddress)
         return nullptr;
 
@@ -52,7 +52,7 @@ PEB* ReadRemotePEB(HANDLE hProcess)
     return pPEB;
 }
 
-PLOADED_IMAGE ReadRemoteImage(HANDLE hProcess, LPCVOID lpImageBaseAddress)
+PLOADED_IMAGE_EX ReadRemoteImage(HANDLE hProcess, LPCVOID lpImageBaseAddress)
 {
     BYTE* lpBuffer = new BYTE[BUFFER_SIZE];
     if(!ReadProcessMemory(hProcess, lpImageBaseAddress, lpBuffer, BUFFER_SIZE, nullptr))
@@ -61,13 +61,17 @@ PLOADED_IMAGE ReadRemoteImage(HANDLE hProcess, LPCVOID lpImageBaseAddress)
         return nullptr;	
     }
 
-    PIMAGE_DOS_HEADER pDOSHeader = (PIMAGE_DOS_HEADER)lpBuffer;
-    PLOADED_IMAGE pImage = new LOADED_IMAGE();
+    auto pDOSHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(lpBuffer);
+    auto e_lfanew = pDOSHeader->e_lfanew;
+    auto pImage = new LOADED_IMAGE_EX();
 
-    pImage->FileHeader = (PIMAGE_NT_HEADERS32)(lpBuffer + pDOSHeader->e_lfanew);
+    pImage->RawData.assign(lpBuffer, lpBuffer + BUFFER_SIZE);
+    delete[] lpBuffer;
+
+    auto basePtr = reinterpret_cast<uintptr_t>(pImage->RawData.data());
+    pImage->FileHeader = reinterpret_cast<PIMAGE_NT_HEADERS_T>(basePtr + e_lfanew);
     pImage->NumberOfSections = pImage->FileHeader->FileHeader.NumberOfSections;
-    pImage->Sections = (PIMAGE_SECTION_HEADER)(lpBuffer + pDOSHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS32));
+    pImage->Sections = reinterpret_cast<PIMAGE_SECTION_HEADER>(basePtr + e_lfanew + sizeof(IMAGE_NT_HEADERS_T));
 
-    delete[] lpBuffer; // Avoid memory leak
     return pImage;
 }
