@@ -3,12 +3,120 @@
 #include "stdafx.h"
 #include <windows.h>
 #include <cstdint>
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <unordered_map>
 #include <vector>
+#include <TlHelp32.h>
 #include "internals.h"
 #include "pe.h"
 
 namespace
 {
+
+std::string ToLower(std::string value)
+{
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+        });
+
+        return value;
+}
+
+HMODULE GetRemoteModuleHandleCaseInsensitive(HANDLE hProcess, const std::string& moduleName)
+{
+        DWORD processId = GetProcessId(hProcess);
+        if (!processId)
+        {
+                return nullptr;
+        }
+
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        if (hSnapshot == INVALID_HANDLE_VALUE)
+        {
+                return nullptr;
+        }
+
+        MODULEENTRY32 moduleEntry = {0};
+        moduleEntry.dwSize = sizeof(moduleEntry);
+
+        std::string needle = ToLower(moduleName);
+
+        BOOL hasModule = Module32First(hSnapshot, &moduleEntry);
+        while (hasModule)
+        {
+                std::string candidate = ToLower(moduleEntry.szModule);
+                if (candidate == needle)
+                {
+                        CloseHandle(hSnapshot);
+                        return moduleEntry.hModule;
+                }
+
+                hasModule = Module32Next(hSnapshot, &moduleEntry);
+        }
+
+        CloseHandle(hSnapshot);
+        return nullptr;
+}
+
+bool EnsureRemoteModuleLoaded(
+        HANDLE hProcess,
+        const std::string& moduleName,
+        HMODULE& hRemoteModule)
+{
+        hRemoteModule = GetRemoteModuleHandleCaseInsensitive(hProcess, moduleName);
+        if (hRemoteModule)
+        {
+                return true;
+        }
+
+        SIZE_T moduleNameSize = moduleName.size() + 1;
+        LPVOID pRemoteString = VirtualAllocEx(
+                hProcess,
+                0,
+                moduleNameSize,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE);
+
+        if (!pRemoteString)
+        {
+                return false;
+        }
+
+        if (!WriteProcessMemory(
+                        hProcess,
+                        pRemoteString,
+                        moduleName.c_str(),
+                        moduleNameSize,
+                        0))
+        {
+                VirtualFreeEx(hProcess, pRemoteString, 0, MEM_RELEASE);
+                return false;
+        }
+
+        HANDLE hThread = CreateRemoteThread(
+                hProcess,
+                0,
+                0,
+                reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibraryA),
+                pRemoteString,
+                0,
+                0);
+
+        if (!hThread)
+        {
+                VirtualFreeEx(hProcess, pRemoteString, 0, MEM_RELEASE);
+                return false;
+        }
+
+        WaitForSingleObject(hThread, INFINITE);
+        CloseHandle(hThread);
+        VirtualFreeEx(hProcess, pRemoteString, 0, MEM_RELEASE);
+
+        hRemoteModule = GetRemoteModuleHandleCaseInsensitive(hProcess, moduleName);
+        return hRemoteModule != nullptr;
+}
 
 bool ResolveImports(
         HANDLE hProcess,
@@ -16,6 +124,9 @@ bool ResolveImports(
         BYTE* pLocalImage,
         PIMAGE_NT_HEADERS_T pSourceHeaders)
 {
+        std::unordered_map<std::string, HMODULE> remoteModuleCache;
+        std::unordered_map<std::string, HMODULE> localModuleCache;
+
         const auto& importDirectory =
                 pSourceHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
@@ -29,18 +140,50 @@ bool ResolveImports(
 
         while (pImportDescriptor->Name)
         {
-                auto pModuleName = reinterpret_cast<char*>(
-                        pLocalImage + pImportDescriptor->Name);
+                auto pModuleName = reinterpret_cast<char*>(pLocalImage + pImportDescriptor->Name);
+                std::string moduleName = pModuleName;
+                std::string lookupName = ToLower(moduleName);
 
-                HMODULE hModule = GetModuleHandleA(pModuleName);
-                if (!hModule)
+                HMODULE hLocalModule = nullptr;
+                auto localIt = localModuleCache.find(lookupName);
+                if (localIt != localModuleCache.end())
                 {
-                        hModule = LoadLibraryA(pModuleName);
+                        hLocalModule = localIt->second;
+                }
+                else
+                {
+                        hLocalModule = GetModuleHandleA(moduleName.c_str());
+                        if (!hLocalModule)
+                        {
+                                hLocalModule = LoadLibraryA(moduleName.c_str());
+                        }
+
+                        if (hLocalModule)
+                        {
+                                localModuleCache.emplace(lookupName, hLocalModule);
+                        }
                 }
 
-                if (!hModule)
+                if (!hLocalModule)
                 {
                         printf("Failed to load dependency %s\r\n", pModuleName);
+                        return false;
+                }
+
+                HMODULE hRemoteModule = nullptr;
+                auto remoteIt = remoteModuleCache.find(lookupName);
+                if (remoteIt != remoteModuleCache.end())
+                {
+                        hRemoteModule = remoteIt->second;
+                }
+                else if (EnsureRemoteModuleLoaded(hProcess, moduleName, hRemoteModule))
+                {
+                        remoteModuleCache.emplace(lookupName, hRemoteModule);
+                }
+
+                if (!hRemoteModule)
+                {
+                        printf("Failed to load remote dependency %s\r\n", pModuleName);
                         return false;
                 }
 
@@ -83,7 +226,11 @@ bool ResolveImports(
                                 return false;
                         }
 
-                        ULONG_PTR functionAddress = reinterpret_cast<ULONG_PTR>(pFunction);
+                        ULONG_PTR functionAddressOffset =
+                                reinterpret_cast<ULONG_PTR>(pFunction) -
+                                reinterpret_cast<ULONG_PTR>(hLocalModule);
+                        ULONG_PTR remoteFunctionAddress =
+                                reinterpret_cast<ULONG_PTR>(hRemoteModule) + functionAddressOffset;
                         SIZE_T bytesWritten = 0;
                         auto pRemoteThunk = reinterpret_cast<PVOID>(
                                 remoteBase + pImportDescriptor->FirstThunk +
@@ -92,10 +239,10 @@ bool ResolveImports(
                         if (!WriteProcessMemory(
                                     hProcess,
                                     pRemoteThunk,
-                                    &functionAddress,
-                                    sizeof(functionAddress),
+                                    &remoteFunctionAddress,
+                                    sizeof(remoteFunctionAddress),
                                     &bytesWritten) ||
-                                bytesWritten != sizeof(functionAddress))
+                                bytesWritten != sizeof(remoteFunctionAddress))
                         {
                                 printf("Failed to write import thunk for %s\r\n", pModuleName);
                                 return false;
