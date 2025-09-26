@@ -1,0 +1,15 @@
+# Ignorar pastas de build do Visual Studio
+x64/
+Debug/
+Release/
+
+# Ignorar arquivos de log de build e outros arquivos temporários
+*.tlog
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+
+# Ignorar pasta do Visual Studio
+**/.vs/

